@@ -15,6 +15,14 @@ from .utils import VBAWriter
 
 
 cache = {}
+first_formula_func = re.compile(r"(.*?)\(")
+
+
+def get_first_function(formula):
+    res = first_formula_func.match(formula)
+    if res is None:
+        return
+    return res.group(0).replace("=","").replace("(","").strip()
 
 
 class AsyncThread(Thread):
@@ -306,13 +314,17 @@ def call_udf(module_name, func_name, args, this_workbook=None, caller=None):
             result_height = len(xl_result)
             result_width = result_height and len(xl_result[0])
             result_size = (max(1, result_height), max(1, result_width))
-        if current_size != result_size:
+        if current_size != result_size:  # this should be done at the end of the execution of the equation as resizing can throw error if it keeps resizing at every nested equation evaluation. Only print to excel at the end
             from .server import add_idle_task
-            add_idle_task(DelayedResizeDynamicArrayFormula(
-                Range(impl=xlplatform.Range(xl=caller)).resize(*result_size),
-                caller,
-                current_size[0] > result_size[0] or current_size[1] > result_size[1]
-            ))
+            if func_name == get_first_function(caller.FormulaArray):
+                #print(F"printing at function '{func_name}' result of '{caller.FormulaArray}'")
+                add_idle_task(DelayedResizeDynamicArrayFormula(
+                    Range(impl=xlplatform.Range(xl=caller)).resize(*result_size),
+                    caller,
+                    current_size[0] > result_size[0] or current_size[1] > result_size[1]
+                ))
+            else:
+                del cache[cache_key]  # asume resize is done and delete cache
         else:
             del cache[cache_key]
 
