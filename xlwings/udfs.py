@@ -9,12 +9,17 @@ from threading import Thread
 from importlib import reload  # requires >= py 3.4
 
 from win32com.client import Dispatch, CDispatch
+import pywintypes
 
 from . import conversion, xlplatform, Range, apps
 from .utils import VBAWriter
-
+import pandas as pd
+import warnings
 
 cache = {}
+cache_count_references = {}
+cache_to_delete = {}
+cache_reapeated_formulas = {}
 first_formula_func = re.compile(r"(.*?)\(")
 
 
@@ -38,6 +43,19 @@ class AsyncThread(Thread):
         self.expand = expand
 
     def run(self):
+        #apps[self.pid].books[self.book].sheets[self.sheet][self.address].api._inner
+        new_caller = None
+        for i, arg in enumerate(self.args):
+            if isinstance(arg, CDispatch):
+                if new_caller is None:
+                    # FIXME this should simulate the actual object in main thread
+                    r"""
+                     File "H:\common_partition\MEGAsync\python_projects\usb_projects\usb_python_env\lib\site-packages\xlwings\_xlwindows.py", line 602, in range
+                        xl1 = self.xl.Range(arg1)
+                    AttributeError: 'NoneType' object has no attribute 'Range'
+                    """
+                    new_caller = apps[self.pid].books[self.book].sheets[self.sheet][self.address]#.api._inner
+                self.args[i] = new_caller  # replace stale caller with new
         cache[self.cache_key] = self.func(*self.args)
 
         if self.expand:
@@ -238,9 +256,19 @@ def get_udf_module(module_name):
 def get_cache_key(func, args, caller):
     """only use this if function is called from cells, not VBA"""
     xw_caller = Range(impl=xlplatform.Range(xl=caller))
-    return (func.__name__ + str(args) + str(xw_caller.sheet.book.app.pid) +
-            xw_caller.sheet.book.name + xw_caller.sheet.name + xw_caller.address.split(':')[0])
+    # FIXED bug in which pandas dataframes were converted to test for the key but only some values appeared in the
+    # cache key so when values from source were updated key didn't change getting outdated cached data
+    # DONE improved key for any cell so that cache can be for multiple cells
+    return (func.__name__, str([i.to_string() if isinstance(i, pd.DataFrame) else i for i in args]))
+    #return (func.__name__, str([i.to_string() if isinstance(i, DataFrame) else i for i in args]),
+    #        str(xw_caller.sheet.book.app.pid) + xw_caller.sheet.book.name + xw_caller.sheet.name + xw_caller.address.split(':')[0])
 
+
+def _get_str(data):
+    if isinstance(data, str):
+        return data
+    else:
+        return _get_str(data[0])
 
 def call_udf(module_name, func_name, args, this_workbook=None, caller=None):
 
@@ -273,8 +301,102 @@ def call_udf(module_name, func_name, args, this_workbook=None, caller=None):
     if this_workbook:
         xlplatform.BOOK_CALLER = Dispatch(this_workbook)
 
+    # get actual caller range
+    xw_caller = Range(impl=xlplatform.Range(xl=caller))
+    eq_range = F"'[{xw_caller.sheet.book.name}]{xw_caller.sheet.name}'!{xw_caller.address}"
+    eq_start = eq_range.split(":")[0]
+    alternative_eq = xw_caller.sheet[eq_start].formula.replace(",",";") # FIX BUG # _get_str(xw_caller.formula)
+    this_equation = alternative_eq   # BUGFIX to not getting equation
+    #try:
+    #    this_equation = caller.FormulaArray  # actual formula
+    #    if alternative_eq != this_equation:
+    #        warnings.warn(f"alternative equation '{alternative_eq}' differente to real '{this_equation}'")
+    #except pywintypes.com_error:
+    #    if alternative_eq:
+    #        warnings.warn(f"could not retrieve equation on addres {eq_start}. alternative '{alternative_eq}''")
+    #        this_equation = alternative_eq
+    #    else:
+    #        print(f"could not retrieve equation on addres {eq_start}")
+    #        raise
+
+    # format: func_name, args
+    cache_key = get_cache_key(func, args, caller)
+    last_func_count = this_equation.count(func_name)
+    eq_key = (eq_start, this_equation)  # creates key with start of equation address and equation
+
+    # get the counts of last function in the equation to prevent prints to excel until the last opperation
+    is_last_function = func_name == get_first_function(this_equation)
+    if is_last_function:
+        if last_func_count > 1:
+            if eq_key in cache_reapeated_formulas:
+                # reduce real count usage
+                cache_reapeated_formulas[eq_key] -= 1
+                last_func_count = cache_reapeated_formulas[eq_key]
+            else:
+                # start to track function execution
+                cache_reapeated_formulas[eq_key] = last_func_count
+            print(F"executing iteration {last_func_count} in function '{func_name}' result of {eq_key}")
+        if last_func_count <= 1:
+            try:
+                del cache_reapeated_formulas[eq_key]
+            except KeyError:
+                pass
+
+    save_new_cache = False
+    try:
+        stored_eq, stored_keys = cache_to_delete[eq_start]
+
+        # check if equation changed
+        if stored_eq != this_equation:
+            # process of eliminating cache of old equation
+            for stored_cache in stored_keys:
+
+                # check if there are no more referencese on old cache, it should be deleted
+                count_ref = cache_count_references.get(stored_cache, None)
+                if count_ref is not None:
+                    count_ref -= 1
+
+                # delete cache if there are no more references
+                if count_ref is not None and count_ref <= 0:
+                    if stored_cache == cache_key:
+                        continue   # do not dete cache to current reference
+
+                    # delete cache
+                    print(f"deleting cache of eq '{stored_eq}' in cell {eq_start}")
+                    for i, my_cache in enumerate((cache, cache_count_references)):
+                        try:
+                            # prevent memory leakage
+                            # traying to delete old data
+                            del my_cache[stored_cache]
+                        except KeyError:
+                            pass
+                else:
+                    # update decrease
+                    cache_count_references[stored_cache] = count_ref
+            save_new_cache = True
+        else:
+            # check if this is a new cache to keep track of it for deleting later
+            if cache_key not in stored_keys:
+                # same equation, new key to keep reference
+                count = cache_count_references.get(cache_key, 0)
+                cache_count_references[cache_key] = count + 1
+
+                # add key to tracked cache_key
+                stored_keys.add(cache_key)
+
+    except KeyError:
+        save_new_cache = True
+
+    if save_new_cache:
+        # increase number of references as cache is used in this cell equation
+        count = cache_count_references.get(cache_key, 0)
+        cache_count_references[cache_key] = count + 1
+
+        # store new information of caches in equation cell
+        store_keys = {cache_key}
+        cache_to_delete[eq_start] = (this_equation, store_keys)
+
     if func_info['async_mode'] and func_info['async_mode'] == 'threading':
-        cache_key = get_cache_key(func, args, caller)
         cached_value = cache.get(cache_key)
         if cached_value is not None:  # test against None as np arrays don't have a truth value
             if not is_dynamic_array:  # for dynamic arrays, the cache is cleared below
@@ -282,7 +404,6 @@ def call_udf(module_name, func_name, args, this_workbook=None, caller=None):
             ret = cached_value
         else:
             # You can't pass pywin32 objects directly to threads
-            xw_caller = Range(impl=xlplatform.Range(xl=caller))
             thread = AsyncThread(xw_caller.sheet.book.app.pid,
                                  xw_caller.sheet.book.name,
                                  xw_caller.sheet.name,
@@ -295,7 +416,6 @@ def call_udf(module_name, func_name, args, this_workbook=None, caller=None):
             return [["#N/A waiting..." * xw_caller.columns.count] * xw_caller.rows.count]
     else:
         if is_dynamic_array:
-            cache_key = get_cache_key(func, args, caller)
             cached_value = cache.get(cache_key)
             if cached_value is not None:
                 ret = cached_value
@@ -314,19 +434,20 @@ def call_udf(module_name, func_name, args, this_workbook=None, caller=None):
             result_height = len(xl_result)
             result_width = result_height and len(xl_result[0])
             result_size = (max(1, result_height), max(1, result_width))
+
         if current_size != result_size:  # this should be done at the end of the execution of the equation as resizing can throw error if it keeps resizing at every nested equation evaluation. Only print to excel at the end
-            from .server import add_idle_task
-            if func_name == get_first_function(caller.FormulaArray):
-                #print(F"printing at function '{func_name}' result of '{caller.FormulaArray}'")
+            # Only write to excel if this is last result
+            if is_last_function and last_func_count <=1:
+                from .server import add_idle_task
+                print(F"executed with resize at iteration {last_func_count} in function '{func_name}' result of {eq_key}")
+                
                 add_idle_task(DelayedResizeDynamicArrayFormula(
                     Range(impl=xlplatform.Range(xl=caller)).resize(*result_size),
                     caller,
                     current_size[0] > result_size[0] or current_size[1] > result_size[1]
                 ))
             else:
-                del cache[cache_key]  # asume resize is done and delete cache
-        else:
-            del cache[cache_key]
+                print(f"needs clearing! but ignored. iteration {last_func_count} in function '{func_name}' result of {eq_key}")
 
     return xl_result
 
