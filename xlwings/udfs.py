@@ -440,6 +440,7 @@ def call_udf(module_name, func_name, args, this_workbook=None, caller=None):
             if is_last_function and last_func_count <=1:
                 from .server import add_idle_task
                 print(F"executed with resize at iteration {last_func_count} in function '{func_name}' result of {eq_key}")
+                
                 add_idle_task(DelayedResizeDynamicArrayFormula(
                     Range(impl=xlplatform.Range(xl=caller)).resize(*result_size),
                     caller,
